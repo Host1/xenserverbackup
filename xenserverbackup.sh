@@ -1,6 +1,7 @@
 #!/bin/bash -ue
 #  Xenserver backup script using snapshots (via exports).
 #  Copyright (C) 2010  Christian Bryn <chr.bryn@gmail.com>
+#  Contributor: Lars Falk-Petersen <dev@falk-petersen.no>
 #
 #  This program is free software: you can redistribute it and/or modify
 #  it under the terms of the GNU General Public License as published by
@@ -51,17 +52,27 @@ function backup_vm {
     # params: <vm-name:vm-uuid>
     host="${1}"
     label="${host%%:*}"
+
+    week=""
+    if [ "${noweek}" == "false" ]; then
+        week=$( date "+%V" )
+    fi
+
     # snapshot the mofo
-    snap=$( xe vm-snapshot vm="${host##*:}" new-name-label=backup_$( date "+%s" )  ) || return 1;
+    exporttimestamp=`date "+%Y-%m-%d_%H.%M"`
+    snap=$( xe vm-snapshot vm="${host##*:}" new-name-label=${label}-${exporttimestamp}_backup ) || return 1;
     trap "xe vm-uninstall uuid="${snap}" force=true > /dev/null" EXIT
     xe template-param-set is-a-template=false uuid="${snap}" > /dev/null || return 1;
-    local backup_file_path="${backup_dir}/$( date "+%V" )/${label%% }"
+    local backup_file_path="${backup_dir}/${week}/${label%% }"
     if [ ! -d "${backup_file_path}"  ]; then
         mkdir -p "${backup_file_path}" || { p_err "Could not create directory ${backup_file_path}!"; exit 1; }
     fi
     # export snapshot.
-    xe vm-export compress="${compression}" vm="${snap}" filename="${backup_file_path}/${label}-$( date "+%Y-%m-%d_%H.%M" ).xva" > /dev/null || return 1;
+    xe vm-export compress="${compression}" vm="${snap}" filename="${backup_file_path}/${label}-${exporttimestamp}.xva" > /dev/null || return 1;
     xe vm-uninstall uuid="${snap}" force=true > /dev/null
+
+    # create .done-file
+    touch "${backup_file_path}/${label}-${exporttimestamp}.done"
 }
 
 function read_config {
@@ -70,7 +81,7 @@ function read_config {
     # the sourcing bit works in bash 4, but not in bash 3. darn. let's do something else
     if [ -f "${config_file}" ]; then  
         f=$(mktemp) ; trap "rm ${f} >/dev/null 2>&1" EXIT
-        egrep "^backup_all_vms=|^backup_dir=|^compression=|^exception_list=|^logfile=|^logging=|^mount_command=|^uuids=|^vm_names=" "${config_file}" > ${f}
+        egrep "^backup_all_vms=|^backup_dir=|^compression=|^exception_list=|^logfile=|^logging=|^mount_command=|^uuids=|^vm_names=|^noweek=" "${config_file}" > ${f}
         source ${f} 
         rm ${f} ; unset f
     fi
@@ -111,6 +122,7 @@ Usage: ${0} [-a|-b <backup dir>|-c [true|false]|-C <config file>|-d|-e "<excepti
     -e      Space separated list of VMs that should not be backed up.
     -l      Enable/disable logging with 'true' or 'false'.
     -m      Mount command to run previous to running the backup.
+    -s      Simple path in output. No weekly subfolder.
     -u      Specify VMs to back up via uuid.
     -w      Write parameters -a.-b,-c,-e,-m as specified on the command line to 
             default config file path and exit. 
@@ -122,6 +134,8 @@ Examples:
     ${0} -a -b /mnt/backup -e "<vm-name> <vm-name>"
     ${0} -a -b /mnt/backup -e "<vm-name> <vm-name>" -m 'mount -t nfs <ip>:/share /mnt/backup'
     ${0} -a -b /mnt/backup -e "<vm-name> <vm-name>" -m 'mount -t nfs <ip>:/share /mnt/backup' -w
+
+Version 20120607
 EOF
 }
 
@@ -146,14 +160,16 @@ exception_list=""
 logfile=/var/log/xenserver-backup.log
 logging="false"
 mount_command=""
+noweek="false"
 uuids=""
 vm_names=""
 writeconfig="false"
+lockfile=/var/run/xenserver-backup.lock
 
 # override defaults, then let command line override the config file..
 read_config
 
-while getopts hc:Cab:de:l:L:m:nu:w o
+while getopts hc:C:ab:de:l:L:m:nu:ws o
 do
     case $o in
         h)
@@ -187,6 +203,9 @@ do
             [ "${backup_dir}" == "" ] && { p_err "No backup destination path given."; exit 1; }
             grep -q "${backup_dir}" <( echo "${mount_command}" ) || { p_err "mount command '${mount_command}' does not contain backup dir path '${backup_dir}'?"; exit 1; }
             ;;
+        s)
+            noweek="true"
+            ;;
         u)
             uuids="${OPTARG}"
             ;;
@@ -217,8 +236,9 @@ logging='${logging}'
 mount_command='${mount_command}'
 uuids='${uuids}'
 vm_names='${@}'
+noweek='${noweek}'
 EOF
-    printf "backup_all_vms='%s'\nbackup_dir='%s'\ncompression='%s'\nexception_list='%s'\nlogfile='%s'\nlogging='%s'\nmount_command='%s'\nuuids='%s'\nvm_names='%s'\n" "${backup_all_vms:-}" "${backup_dir:-}" "${compression:-}" "${exception_list:-}" "${logfile:-}" "${logging:-}" "${mount_command:-}" "${uuids:-}" "${@:-}" > ${config_file}
+    printf "backup_all_vms='%s'\nbackup_dir='%s'\ncompression='%s'\nexception_list='%s'\nlogfile='%s'\nlogging='%s'\nmount_command='%s'\nuuids='%s'\nvm_names='%s'\nnoweek='%s'\n" "${backup_all_vms:-}" "${backup_dir:-}" "${compression:-}" "${exception_list:-}" "${logfile:-}" "${logging:-}" "${mount_command:-}" "${uuids:-}" "${@:-}" "${noweek:-}" > ${config_file}
     exit $?
 fi
 
@@ -234,7 +254,11 @@ which xe >/dev/null 2>&1 || { p_err "xe not in path!"; exit 1; }
 [ ! -d "${backup_dir}"  ] && { p_err "Backup path ${backup_dir} is not a directory"; exit 1; }
 [ "${compression}" == "true" -o "${compression}" == "false" ] || { p_err "'compression' set to '${compression}', must be either true or false"; exit 1; }
 
-[ "${logging}" == "true" ] && exec >>${logfile} 2>>${logfile}
+[ "${logging}" == "true" ] && \
+  { #create folder if it doesn't exist
+    mkdir -p $( dirname ${logfile} )
+    exec >>${logfile} 2>>${logfile}
+  }
 
 ## main
 # this one should override config file parameter and exception list.
@@ -256,26 +280,35 @@ fi
 
 start_time="$( date '+%s' )"
 
-p_info "---------- Initiating backup run... ----------"
-[ "${dry_run}" == "true" ] && p_info "Performing dry run, will not attempt to actually backup any VMs"
-[ -t 1 -a "${logging}" == "true" ] && { logging="false"; p_info "Logging on, check log file $logfile for status."; logging="true"; }
-# backup vms by name or uuid if not in the exception list
-IFS="|"
-for vm in ${vm_list[@]}; do
-    ## vm=hostname:uuid
-    if [ "${vm_names:-}" != "" ]; then
-        [[ ! "${vm_names}" =~ ${vm%%:*} ]] && continue
-    fi
-    if [ "${uuids:-}" != "" ]; then
-        [[ ! "${uuids}" =~ ${vm##*:} ]] && continue
-    fi
-    [[ "${exception_list}" =~ ${vm%%:*} ]] && continue
-    [[ "${exception_list}" =~ ${vm##*:} ]] && continue
-    
-    p_info "Backing up ${vm%%:*} with uuid ${vm##*:}"
-    vm_start_time="$( date '+%s' )"
-    [ "${dry_run}" == "false" ] && backup_vm "${vm}" || continue
-    p_info "Backup of ${vm%%:*} with uuid ${vm##*:} ended successfully taking $(($(date "+%s")-${vm_start_time})) seconds."
-done
-unset IFS
-p_info "Backup run ended taking $(($(date "+%s")-${start_time})) seconds."
+if ( set -o noclobber; echo "$$" > "$lockfile") 2> /dev/null; then
+    trap "rm -f $lockfile; exit$?" INT TERM EXIT
+
+    p_info "---------- Initiating backup run to ${backup_dir} ----------"
+    [ "${dry_run}" == "true" ] && p_info "Performing dry run, will not attempt to actually backup any VMs"
+    [ -t 1 -a "${logging}" == "true" ] && { logging="false"; p_info "Logging on, check log file $logfile for status."; logging="true"; }
+    # backup vms by name or uuid if not in the exception list
+    IFS="|"
+    for vm in ${vm_list[@]}; do
+        ## vm=hostname:uuid
+        if [ "${vm_names:-}" != "" ]; then
+            [[ ! "${vm_names}" =~ ${vm%%:*} ]] && continue
+        fi
+        if [ "${uuids:-}" != "" ]; then
+            [[ ! "${uuids}" =~ ${vm##*:} ]] && continue
+        fi
+        [[ "${exception_list}" =~ ${vm%%:*} ]] && continue
+        [[ "${exception_list}" =~ ${vm##*:} ]] && continue
+        
+        p_info "Backing up ${vm%%:*} with uuid ${vm##*:}"
+        vm_start_time="$( date '+%s' )"
+        [ "${dry_run}" == "false" ] && backup_vm "${vm}" || continue
+        p_info "Backup of ${vm%%:*} with uuid ${vm##*:} ended successfully taking $(($(date "+%s")-${vm_start_time})) seconds."
+    done
+    unset IFS
+    p_info "Backup run ended taking $(($(date "+%s")-${start_time})) seconds."
+
+    rm -f $lockfile
+    trap - INT TERM EXIT
+else
+    echo "Error: lockfile found in $lockfile, held by $(cat $lockfile)"
+fi
